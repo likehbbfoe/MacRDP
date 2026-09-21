@@ -1,0 +1,36 @@
+# Local metadata; retain only project build configuration.
+/.*
+!/.gitignore
+!/.cargo/
+**/.DS_Store
+*.iml
+*.swo
+*.swp
+*.rs.bk
+*.log
+*.profraw
+*.profdata
+*.lcov
+*.pem
+*.key
+*.p12
+*.sqlite*
+*.db
+*.pid
+.env*
+
+# Build products and dependency caches
+**/target/
+**/node_modules/
+macrdp-ui/dist/
+*.git.bak/
+
+# Private runtime configuration and locally generated artifacts
+config.toml
+config.local.toml
+config.*.local.toml
+!/.cargo/config.toml
+/tls/
+/work/
+/docs/
+/macrdp-ui/src-tauri/gen/

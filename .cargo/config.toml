@@ -1,0 +1,4 @@
+[target.'cfg(target_os = "macos")']
+# macOS 14+ supplies Swift in the system dyld cache. Use the system runtime
+# to avoid loading an older Xcode runtime into the same process.
+rustflags = ["-C", "link-arg=-Wl,-rpath,/usr/lib/swift"]
