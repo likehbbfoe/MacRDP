@@ -8,6 +8,8 @@ ironrdp-acceptor = { path = "../../crates/ironrdp-acceptor-patched" }
 name = "macrdp-ui"
 version = "0.1.0"
 edition = "2021"
+license = "GPL-3.0-only"
+repository = "https://github.com/likehbbfoe/MacRDP"
 description = "macrdp GUI — Tauri v2 desktop application"
 
 [build-dependencies]

@@ -1,11 +1,20 @@
 # MacRDP
 
+[![Release](https://img.shields.io/github/v/release/likehbbfoe/MacRDP)](https://github.com/likehbbfoe/MacRDP/releases/latest)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-14%2B-black.svg)](https://www.apple.com/macos/)
 
 中文 | [English](README_EN.md)
 
 macOS 原生 RDP 服务端，可使用另一台 Mac 上的 Windows App 连接当前桌面。本仓库关注客户端兼容性、编码性能与稳定性。
+
+## 版本与下载
+
+当前版本：**[v0.1.0](https://github.com/likehbbfoe/MacRDP/releases/tag/v0.1.0)**，首个公开源码版本。完整变更见 [CHANGELOG](CHANGELOG.md)，各版本的功能、修复与使用说明见 [Releases](https://github.com/likehbbfoe/MacRDP/releases)。
+
+本次发行提供源码 ZIP / tar.gz，可按下方说明构建 CLI 或管理界面。项目处于 `0.x` 开发阶段，共享当前登录桌面，不创建独立的 macOS 登录会话。
+
+版本采用 `vMAJOR.MINOR.PATCH` 标签：补丁版本用于兼容性修复，次版本用于新功能；`0.x` 阶段的兼容性变化会在发行说明中注明。`main` 持续开发，需要固定版本时使用对应标签。
 
 ## 来源与许可证
 
@@ -30,7 +39,7 @@ macOS 原生 RDP 服务端，可使用另一台 Mac 上的 Windows App 连接当
 ```sh
 git clone https://github.com/likehbbfoe/MacRDP.git
 cd MacRDP
-cargo build --release -p macrdp-server
+cargo build --locked --release -p macrdp-server
 cp config.example.toml config.toml
 ```
 
@@ -38,6 +47,20 @@ cp config.example.toml config.toml
 
 ```sh
 ./target/release/macrdp-server --config config.toml
+```
+
+查看服务端版本：
+
+```sh
+./target/release/macrdp-server --version
+```
+
+构建 Tauri 管理界面：
+
+```sh
+cd macrdp-ui
+npm ci
+npm run tauri -- build --bundles app
 ```
 
 在 Windows App 中添加电脑，地址填写服务端的局域网 IP 和端口，例如 `<Mac-IP>:13389`。使用配置中的 RDP 凭据，不是 macOS 登录密码。
@@ -82,6 +105,10 @@ bitrate_mbps = 20
 - `crates/macrdp-capture`、`macrdp-input`：采集与输入。
 - `crates/macrdp-encode`：VideoToolbox、OpenH264 与色彩转换。
 - `crates/ironrdp-server-gfx`、`ironrdp-acceptor-patched`：修改后的协议依赖。
+
+## 反馈与贡献
+
+通过 [Issues](https://github.com/likehbbfoe/MacRDP/issues) 报告问题或提出功能建议，请注明 MacRDP 版本、macOS 版本、客户端版本及相关编码配置。请勿公开密码、证书私钥或其他个人信息。代码改进可提交至 `main` 的 Pull Request。
 
 ## 参考项目
 

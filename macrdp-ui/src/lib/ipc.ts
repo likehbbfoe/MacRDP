@@ -26,10 +26,8 @@ export const api = {
     invoke<ConnectionHistory[]>("get_connection_history", { limit, offset }),
   getTrafficStats: (days: number) =>
     invoke<TrafficStats[]>("get_traffic_stats", { days }),
-  checkForUpdates: () =>
-    invoke<{ available: boolean; version?: string; url?: string }>(
-      "check_for_updates"
-    ),
+  openProjectPage: (page: "repository" | "releases") =>
+    invoke<void>("open_project_page", { page }),
   showMainWindow: () => invoke<void>("show_main_window"),
   openSystemPreferences: (pane: string) =>
     invoke<void>("open_system_preferences", { pane }),

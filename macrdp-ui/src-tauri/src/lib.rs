@@ -105,7 +105,7 @@ pub fn run() {
             commands::get_logs,
             commands::get_connection_history,
             commands::get_traffic_stats,
-            commands::check_for_updates,
+            commands::open_project_page,
             commands::show_main_window,
             commands::open_system_preferences,
             commands::quit_app,

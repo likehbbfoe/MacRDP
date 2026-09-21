@@ -65,7 +65,7 @@ encoder = "hardware"
 # 色度采样模式
 # 默认值: avc420
 # 可选值:
-#   "avc420" — 标准 YUV 4:2:0 色度采样 (兼容所有 RDP 客户端)
+#   "avc420" — 标准 YUV 4:2:0 色度采样 (需要支持 AVC 的 RDP 客户端)
 #   "avc444" — 完整 YUV 4:4:4 色度, 通过双流 AVC444 传输 (需要 V10+ 客户端, 画质最佳)
 # chroma_mode = "avc420"
 

@@ -4,7 +4,7 @@ use tauri::Emitter;
 use tauri::Manager;
 use tauri::State;
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::database::Database;
 use crate::event_bridge::TauriEventBridge;
@@ -14,6 +14,35 @@ use crate::state::AppState;
 #[derive(Debug, Clone, Serialize)]
 pub struct SetConfigResponse {
     pub restart_required: bool,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProjectPage {
+    Repository,
+    Releases,
+}
+
+impl ProjectPage {
+    fn url(&self) -> &'static str {
+        match self {
+            Self::Repository => "https://github.com/likehbbfoe/MacRDP",
+            Self::Releases => "https://github.com/likehbbfoe/MacRDP/releases/latest",
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn open_project_page(page: ProjectPage) -> Result<(), String> {
+    let status = tokio::process::Command::new("/usr/bin/open")
+        .arg(page.url())
+        .status()
+        .await
+        .map_err(|err| format!("Unable to open the project page: {err}"))?;
+    if !status.success() {
+        return Err("Unable to open the project page in the default browser".to_owned());
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -256,14 +285,6 @@ pub fn get_traffic_stats(
     db: State<'_, Arc<Database>>,
 ) -> Result<Vec<serde_json::Value>, String> {
     db.get_traffic_stats(days.unwrap_or(30))
-}
-
-#[tauri::command]
-pub fn check_for_updates() -> Result<serde_json::Value, String> {
-    Ok(serde_json::json!({
-        "current_version": env!("CARGO_PKG_VERSION"),
-        "available": false,
-    }))
 }
 
 #[tauri::command]

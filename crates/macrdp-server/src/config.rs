@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
 #[derive(Parser, Debug)]
-#[command(name = "macrdp", about = "macOS RDP Server")]
+#[command(name = "macrdp", version, about = "macOS RDP Server")]
 pub struct Cli {
     /// TCP port to listen on
     #[arg(short, long, default_value_t = 3389)]
@@ -83,12 +83,12 @@ pub struct ServerConfig {
     /// Video quality: low_latency, balanced, high_quality (default: high_quality)
     pub quality: Option<String>,
     /// H.264 encoder: software, hardware, auto (default: software)
-    /// - software: OpenH264 CPU encoder (P-frame support, ~40ms latency)
-    /// - hardware: VideoToolbox GPU encoder (IDR-only, ~6ms latency, higher bandwidth)
+    /// - software: OpenH264 CPU encoder with Accelerate/vImage color conversion
+    /// - hardware: VideoToolbox hardware H.264 encoder; falls back to software on initialization failure
     /// - auto: same as software
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
-    /// - avc420: standard 4:2:0 chroma (compatible with all RDP clients)
+    /// - avc420: standard 4:2:0 chroma (requires an AVC-capable RDP client)
     /// - avc444: full 4:4:4 chroma via dual-stream AVC444 (requires V10+ client, best quality)
     pub chroma_mode: Option<String>,
     /// Resolution: "auto" or "WxH" like "3840x2160" (default: "auto")

@@ -1,10 +1,19 @@
 # MacRDP
 
+[![Release](https://img.shields.io/github/v/release/likehbbfoe/MacRDP)](https://github.com/likehbbfoe/MacRDP/releases/latest)
 [![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](LICENSE)
 
 [中文](README.md) | English
 
 A native macOS RDP server for connecting to the current desktop, including from Windows App on another Mac. This repository focuses on compatibility, encoding performance and stability.
+
+## Releases
+
+Current version: **[v0.1.0](https://github.com/likehbbfoe/MacRDP/releases/tag/v0.1.0)**, the first public source release. See [CHANGELOG](CHANGELOG.md) for version history and [Releases](https://github.com/likehbbfoe/MacRDP/releases) for features, fixes and usage notes.
+
+This release provides source ZIP / tar.gz archives; build the CLI or management UI using the instructions below. The project is in `0.x` development and shares the currently logged-in desktop rather than creating a separate macOS login session.
+
+Tags follow `vMAJOR.MINOR.PATCH`: patch releases contain compatible fixes and minor releases add features. Compatibility changes during `0.x` development are called out in release notes. Use a version tag for a fixed snapshot; `main` tracks ongoing development.
 
 ## Upstream and licensing
 
@@ -21,7 +30,7 @@ Requires macOS 14+, Xcode Command Line Tools and current stable Rust. UI develop
 ```sh
 git clone https://github.com/likehbbfoe/MacRDP.git
 cd MacRDP
-cargo build --release -p macrdp-server
+cargo build --locked --release -p macrdp-server
 cp config.example.toml config.toml
 ```
 
@@ -29,6 +38,20 @@ Replace the username and password placeholders before starting:
 
 ```sh
 ./target/release/macrdp-server --config config.toml
+```
+
+Display the server version:
+
+```sh
+./target/release/macrdp-server --version
+```
+
+Build the Tauri management UI:
+
+```sh
+cd macrdp-ui
+npm ci
+npm run tauri -- build --bundles app
 ```
 
 Connect Windows App to `<Mac-IP>:13389` using the configured RDP credentials, not the macOS login password.
@@ -63,6 +86,10 @@ Compatibility varies across clients and codec modes.
 4K changing-content AVC444 can still produce native VideoToolbox frame drops; stable 4K/30fps is not guaranteed.
 
 Known remaining work includes non-AVC fallback, mouse button coordinates and dragging, multiple displays, dynamic resolution and long-running sessions. CLI and UI use different display paths.
+
+## Feedback and contributions
+
+Report problems and feature requests through [Issues](https://github.com/likehbbfoe/MacRDP/issues). Include the MacRDP, macOS and client versions plus relevant encoding settings. Keep passwords, certificate private keys and personal information private. Code contributions can target `main` through a pull request.
 
 ## References
 

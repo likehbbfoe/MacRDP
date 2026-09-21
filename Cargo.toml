@@ -17,9 +17,10 @@ ironrdp-server = { path = "crates/ironrdp-server-gfx" }
 ironrdp-acceptor = { path = "crates/ironrdp-acceptor-patched" }
 
 [workspace.package]
+version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
 license = "GPL-3.0-only"
+repository = "https://github.com/likehbbfoe/MacRDP"
 
 [workspace.dependencies]
 tokio = { version = "1", features = ["full"] }
