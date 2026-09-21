@@ -5,7 +5,7 @@
 # ─── Network ───────────────────────────────────────────────────────────────────
 
 # TCP port to listen on
-# Default: 3389 (standard RDP port, may require sudo)
+# Default: 3389 (standard RDP port)
 # Options: any valid port number (1024-65535 recommended)
 port = 13389
 
@@ -30,44 +30,44 @@ height = 0
 
 # Target frame rate
 # Default: 60
-# Options: 30, 60, 120
+# Options: 1-120 (15 or 30 recommended for older hardware)
 frame_rate = 60
 
 # Target bitrate in Mbps (default: auto-calculated from resolution/fps/quality)
-# Override this to force a specific bitrate. Adaptive quality will still adjust
-# within this ceiling based on network conditions.
+# Range: 1-1000. Omit for automatic selection.
+# The encoder target may be adjusted for network conditions.
 # bitrate_mbps = 50
 
-# HiDPI scale factor
-# Default: 1 (no scaling)
-# Multiplies capture resolution for sharper image on Retina displays.
-# e.g. scale=2 on a 1920x1080 logical display → captures at 3840x2160 (4K)
-# Mouse coordinates are automatically mapped back to logical points.
-# resolution = "3840x2160"
+# Final capture resolution
+# Default: "auto" (uses the display scale with the base width/height)
+# Use explicit dimensions to select the final size, including on Retina displays.
+# Legacy scale strings "1" through "4" remain accepted.
+# Maximum: 8192 pixels per side and 7680x4320 total pixels.
+# resolution = "1920x1080"
 
 # ─── Encoding ──────────────────────────────────────────────────────────────────
 
 # Video quality preset
 # Default: high_quality
 # Options:
-#   "low_latency"  — lower bitrate, fastest encoding (~16 Mbps @ 1080p30)
+#   "low_latency"  — lower automatic bitrate (~16 Mbps @ 1080p30)
 #   "balanced"     — moderate quality and bitrate (~33 Mbps @ 1080p30)
-#   "high_quality" — best visual quality, higher bitrate (~50 Mbps @ 1080p30)
+#   "high_quality" — higher automatic bitrate (~50 Mbps @ 1080p30)
 quality = "high_quality"
 
 # H.264 encoder selection
-# Default: software
+# Default: auto
 # Options:
 #   "software"  — OpenH264 (CPU), full P-frame support; performance depends on the workload
 #   "hardware"  — VideoToolbox media hardware; actual latency depends on the machine
-#   "auto"      — same as software
-encoder = "hardware"
+#   "auto"      — prefer hardware, fall back to software
+encoder = "auto"
 
 # Chroma subsampling mode
 # Default: avc420
 # Options:
 #   "avc420" — standard YUV 4:2:0 (requires an AVC-capable RDP client)
-#   "avc444" — full YUV 4:4:4 via dual-stream AVC444 (requires V10+ client, best quality)
+#   "avc444" — full YUV 4:4:4 via dual-stream AVC444 (requires negotiated AVC444 support)
 # chroma_mode = "avc420"
 
 # ─── TLS ───────────────────────────────────────────────────────────────────────
@@ -87,8 +87,5 @@ encoder = "hardware"
 # Options: trace, debug, info, warn, error
 log_level = "info"
 
-# ─── Session ───────────────────────────────────────────────────────────────────
-
-# Idle timeout in seconds (disconnect after no input)
-# Default: 1800 (30 minutes)
-idle_timeout_secs = 1800
+# Restart the service and reconnect after changing capture or encoding options.
+# Clients without AVC use negotiated bitmap transport (Fast-Path, 32-bit color).

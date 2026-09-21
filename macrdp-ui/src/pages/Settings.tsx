@@ -30,6 +30,7 @@ type CategoryId = (typeof categories)[number]["id"];
 function Settings() {
   const [config, setConfig] = useState<UiConfig | null>(null);
   const [restartRequired, setRestartRequired] = useState(false);
+  const [configError, setConfigError] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<CategoryId>("rdp");
   const { theme, setTheme } = useTheme();
 
@@ -40,12 +41,13 @@ function Settings() {
   const updateConfig = async (key: keyof UiConfig, value: unknown) => {
     try {
       const result = await api.setConfig(key, value);
+      setConfigError(null);
       if (result.restart_required) {
         setRestartRequired(true);
       }
       setConfig((prev) => (prev ? { ...prev, [key]: value } : prev));
     } catch (err) {
-      console.error("Failed to update config:", err);
+      setConfigError(String(err));
     }
   };
 
@@ -87,6 +89,11 @@ function Settings() {
 
       {/* Right panel */}
       <div className="flex-1 overflow-y-auto p-4">
+        {configError && (
+          <Alert className="mb-4" role="alert">
+            <AlertDescription>配置未保存：{configError}</AlertDescription>
+          </Alert>
+        )}
         {/* Restart required banner */}
         {restartRequired && (
           <Alert
@@ -112,7 +119,7 @@ function Settings() {
 
         {activeCategory === "rdp" && (
           <CategorySection title="RDP 服务">
-            <SettingRow label="编码器">
+            <SettingRow label="H.264 编码器" description="自动优先使用硬件，不可用时回退软件">
               <Select
                 value={config.encoder}
                 onValueChange={(v) => updateConfig("encoder", v)}
@@ -121,8 +128,9 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="software">软件编码</SelectItem>
-                  <SelectItem value="hardware">硬件加速</SelectItem>
+                  <SelectItem value="auto">自动选择</SelectItem>
+                  <SelectItem value="software">OpenH264 软件</SelectItem>
+                  <SelectItem value="hardware">VideoToolbox 硬件</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>
@@ -141,6 +149,8 @@ function Settings() {
                   <SelectItem value="8">8 Mbps</SelectItem>
                   <SelectItem value="16">16 Mbps</SelectItem>
                   <SelectItem value="32">32 Mbps</SelectItem>
+                  <SelectItem value="50">50 Mbps</SelectItem>
+                  <SelectItem value="100">100 Mbps</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>
@@ -154,6 +164,7 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
+                  <SelectItem value="15">15 fps</SelectItem>
                   <SelectItem value="30">30 fps</SelectItem>
                   <SelectItem value="60">60 fps</SelectItem>
                   <SelectItem value="120">120 fps</SelectItem>
@@ -161,7 +172,7 @@ function Settings() {
               </Select>
             </SettingRow>
 
-            <SettingRow label="色度模式">
+            <SettingRow label="色度模式" description="AVC420 兼容性优先，AVC444 需要客户端支持">
               <Select
                 value={config.chroma_mode}
                 onValueChange={(v) => updateConfig("chroma_mode", v)}
@@ -170,8 +181,8 @@ function Settings() {
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  <SelectItem value="avc420">avc420</SelectItem>
-                  <SelectItem value="avc444">avc444</SelectItem>
+                  <SelectItem value="avc420">AVC420（推荐）</SelectItem>
+                  <SelectItem value="avc444">AVC444</SelectItem>
                 </SelectContent>
               </Select>
             </SettingRow>

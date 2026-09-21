@@ -3189,6 +3189,7 @@ dependencies = [
  "anyhow",
  "bytes",
  "core-graphics",
+ "foreign-types",
  "screencapturekit",
  "tokio",
  "tracing",

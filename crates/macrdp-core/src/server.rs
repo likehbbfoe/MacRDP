@@ -1,11 +1,5 @@
 //! RDP server lifecycle: start, stop, metrics, connections
 
-/// Parse "WxH" resolution string, e.g. "3840x2160" → Some((3840, 2160))
-fn parse_resolution(s: &str) -> Option<(u32, u32)> {
-    let (w, h) = s.split_once('x')?;
-    Some((w.parse().ok()?, h.parse().ok()?))
-}
-
 /// Resolve resolution config value to (width, height).
 ///
 /// Supports three formats:
@@ -14,26 +8,31 @@ fn parse_resolution(s: &str) -> Option<(u32, u32)> {
 /// - legacy numeric scale (e.g. "2"): multiply logical resolution by scale factor
 pub fn resolve_resolution(
     res_mode: &str,
-    logical_w: u16,
-    logical_h: u16,
-) -> (u16, u16) {
-    if res_mode == "auto" {
-        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
-        tracing::info!(scale, logical_w, logical_h, "Resolution auto: display scale");
-        (logical_w * scale as u16, logical_h * scale as u16)
-    } else if let Some((w, h)) = parse_resolution(res_mode) {
-        tracing::info!(w, h, "Resolution: explicit WxH");
-        (w as u16, h as u16)
-    } else if let Ok(scale) = res_mode.parse::<u32>() {
-        // Legacy hidpi_scale: 1, 2, 3, 4 → multiply logical resolution
-        let scale = scale.max(1).min(4);
-        let (w, h) = (logical_w as u32 * scale, logical_h as u32 * scale);
-        tracing::info!(scale, w, h, logical_w, logical_h, "Resolution: legacy hidpi_scale → {}x{}", w, h);
-        (w as u16, h as u16)
+    logical_w: u32,
+    logical_h: u32,
+) -> Result<(u16, u16)> {
+    let (width, height) = if let Some((width, height)) = res_mode.split_once('x') {
+        (
+            width.parse::<u32>().context("Invalid resolution width")?,
+            height.parse::<u32>().context("Invalid resolution height")?,
+        )
     } else {
-        tracing::warn!(res_mode, "Resolution: unrecognized value, using logical resolution");
-        (logical_w, logical_h)
-    }
+        let scale = if res_mode == "auto" {
+            macrdp_capture::detect_display_scale().unwrap_or(1)
+        } else {
+            let scale = res_mode.parse::<u32>().context("Invalid resolution scale")?;
+            anyhow::ensure!((1..=4).contains(&scale), "Resolution scale must be between 1 and 4");
+            scale
+        };
+        (
+            logical_w.checked_mul(scale).context("Scaled display width overflow")?,
+            logical_h.checked_mul(scale).context("Scaled display height overflow")?,
+        )
+    };
+    macrdp_encode::validate_dimensions(width, height)
+        .with_context(|| format!("Unsupported resolved display size {width}x{height}"))?;
+    tracing::info!(res_mode, width, height, "Display resolution resolved");
+    Ok((u16::try_from(width)?, u16::try_from(height)?))
 }
 
 use std::net::{SocketAddr, TcpListener};
@@ -207,6 +206,7 @@ pub async fn start_server(
     config: ServerConfig,
     handler: impl ServerEventHandler,
 ) -> Result<Arc<ServerHandle>> {
+    config.validate()?;
     let handler: Arc<dyn ServerEventHandler> = Arc::new(handler);
 
     // Notify handler: starting
@@ -228,17 +228,17 @@ pub async fn start_server(
     let (sck_w, sck_h) = match permissions::detect_display_size() {
         Ok((w, h)) => {
             tracing::info!(width = w, height = h, "SCK logical display size");
-            (w as u16, h as u16)
+            (w, h)
         }
         Err(e) => {
             tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
-            (1920u16, 1080u16)
+            (1920u32, 1080u32)
         }
     };
     let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
         Ok((w, h)) => {
             tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
-            (w as u16, h as u16)
+            (w, h)
         }
         Err(e) => {
             tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
@@ -251,7 +251,7 @@ pub async fn start_server(
 
     // Resolution
     let (width, height) = if config.width > 0 && config.height > 0 {
-        (config.width as u16, config.height as u16)
+        (config.width, config.height)
     } else {
         (sck_w, sck_h)
     };
@@ -268,10 +268,15 @@ pub async fn start_server(
     // Resolution
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
     let res_auto = res_mode == "auto";
-    let (width, height) = resolve_resolution(res_mode, width, height);
+    let (width, height) = resolve_resolution(res_mode, width, height)?;
 
     // Mouse coordinate mapping: mac = rdp × cg_logical ÷ rdp_desktop
-    let coord_mapper = crate::handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
+    let coord_mapper = crate::handler::MouseCoordMapper::new(
+        u16::try_from(cg_w).context("Logical display width exceeds coordinate range")?,
+        u16::try_from(cg_h).context("Logical display height exceeds coordinate range")?,
+        width,
+        height,
+    );
 
     // GFX state (shared between server thread and metrics task)
     let gfx_state = Arc::new(Mutex::new(GfxState::new(width, height, mode_444)));
@@ -563,7 +568,7 @@ fn run_server_thread(args: ServerThreadArgs) {
                         gfx_for_config.lock().unwrap().chroma_mode = Some(mode);
                     }
                     ConfigUpdate::Credentials { username, password } => {
-                        tracing::info!(%username, "Hot-update: credentials");
+                        tracing::info!("Hot-update: credentials");
                         let _ = ev_sender.send(ironrdp_server::ServerEvent::SetCredentials(
                             ironrdp_server::Credentials { username, password, domain: None }
                         ));

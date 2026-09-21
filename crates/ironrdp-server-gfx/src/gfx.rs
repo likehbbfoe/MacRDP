@@ -137,8 +137,19 @@ fn make_dvc_message(pdu: &ServerPdu) -> PduResult<DvcMessage> {
 }
 
 /// Shared state between GfxHandler and the server
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GraphicsMode {
+    Pending,
+    Avc,
+    Bitmap,
+}
+
+/// A connection selects one graphics transport and retains it until reconnect.
+/// This avoids interleaving legacy bitmap updates with an activated GFX surface.
 #[derive(Debug)]
 pub struct GfxState {
+    graphics_mode: GraphicsMode,
+    negotiation_started: Option<std::time::Instant>,
     pub channel_id: Option<u32>,
     pub surface_created: bool,
     pub caps_confirmed: bool,
@@ -191,6 +202,8 @@ pub struct GfxState {
 impl GfxState {
     pub fn new(width: u16, height: u16, avc444_enabled: bool) -> Self {
         Self {
+            graphics_mode: GraphicsMode::Pending,
+            negotiation_started: None,
             channel_id: None,
             surface_created: false,
             caps_confirmed: false,
@@ -286,7 +299,28 @@ impl GfxState {
     }
 
     pub fn is_ready(&self) -> bool {
-        self.channel_id.is_some() && self.avc420_supported && self.caps_confirmed
+        self.graphics_mode == GraphicsMode::Avc
+            && self.channel_id.is_some() && self.avc420_supported && self.caps_confirmed
+    }
+
+    /// Bound negotiation for clients that omit or reject the GFX dynamic channel.
+    pub fn graphics_mode(&mut self) -> GraphicsMode {
+        if self.graphics_mode == GraphicsMode::Pending {
+            let started = self.negotiation_started.get_or_insert_with(std::time::Instant::now);
+            if started.elapsed() >= std::time::Duration::from_secs(2) {
+                self.use_bitmap("GFX capability negotiation timed out");
+            }
+        }
+        self.graphics_mode
+    }
+
+    /// Select legacy output before GFX has been confirmed. An active GFX session
+    /// must remain on that transport even if a later encode attempt fails.
+    pub fn use_bitmap(&mut self, reason: &str) {
+        if self.graphics_mode == GraphicsMode::Pending {
+            info!(reason, "Using negotiated legacy bitmap graphics");
+            self.graphics_mode = GraphicsMode::Bitmap;
+        }
     }
 }
 
@@ -590,6 +624,11 @@ impl DvcProcessor for GfxHandler {
     }
 
     fn process(&mut self, _channel_id: u32, payload: &[u8]) -> PduResult<Vec<DvcMessage>> {
+        // A late capability response must not switch a connection that already
+        // started sending bitmap updates to a different graphics transport.
+        if self.state.lock().unwrap().graphics_mode() == GraphicsMode::Bitmap {
+            return Ok(Vec::new());
+        }
         // Client GFX data is also ZGFX-wrapped. Unwrap the ZGFX layer first.
         let raw_data = unwrap_zgfx(payload);
         let data = raw_data.as_deref().unwrap_or(payload);
@@ -623,14 +662,27 @@ impl DvcProcessor for GfxHandler {
 
                 let mut state = self.state.lock().unwrap();
 
+                if state.graphics_mode() == GraphicsMode::Bitmap {
+                    return Ok(Vec::new());
+                }
+
                 // If already confirmed, ignore duplicate CapabilitiesAdvertise
                 if state.caps_confirmed {
                     info!("GFX caps already confirmed, ignoring duplicate CapabilitiesAdvertise");
                     return Ok(Vec::new());
                 }
 
+                if cap_sets.is_empty() {
+                    state.use_bitmap("client advertised no supported GFX version");
+                    return Ok(Vec::new());
+                }
+
                 let selected = capabilities::select_capability(cap_sets)
                     .map_err(|e| ironrdp_pdu::custom_err!("GfxCapabilities", e))?;
+                if !selected.avc420 {
+                    state.use_bitmap("client GFX capabilities do not support AVC");
+                    return Ok(Vec::new());
+                }
                 let confirmed = selected.capability;
                 state.avc420_supported = selected.avc420;
                 state.avc444_supported = selected.avc444;
@@ -643,14 +695,13 @@ impl DvcProcessor for GfxHandler {
                     "GFX capabilities negotiated"
                 );
 
-                // Send CapabilitiesConfirm from the DVC handler so it goes through
-                // DrdynvcServer's proper encoding path. Bitmaps are suppressed once
-                // GFX channel is open, so no bitmap/GFX mixing will occur.
-                state.confirmed_cap = Some(confirmed.clone());
-                state.caps_confirmed = true;
-
-                let confirm_pdu = ServerPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu(confirmed));
+                let confirm_pdu = ServerPdu::CapabilitiesConfirm(CapabilitiesConfirmPdu(confirmed.clone()));
                 let msg = make_dvc_message(&confirm_pdu)?;
+                // Confirm GFX only when we can use AVC. Otherwise the client
+                // stays on its negotiated bitmap/surface-codec output path.
+                state.confirmed_cap = Some(confirmed);
+                state.caps_confirmed = true;
+                state.graphics_mode = GraphicsMode::Avc;
                 info!("GFX CapabilitiesConfirm sent via DVC handler");
                 Ok(vec![msg])
             }

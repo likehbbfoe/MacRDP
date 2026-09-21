@@ -60,7 +60,7 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     /// Video quality: low_latency, balanced, high_quality (default: high_quality)
     pub quality: Option<String>,
-    /// H.264 encoder: software, hardware, auto (default: software)
+    /// H.264 encoder: software, hardware, auto (default: auto)
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     pub chroma_mode: Option<String>,
@@ -119,20 +119,33 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Reject incompatible or unsafe video options before starting the service.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.port != 0, "port must be between 1 and 65535");
+        macrdp_encode::VideoSettings {
+            encoder: self.encoder.as_deref(),
+            chroma_mode: self.chroma_mode.as_deref(),
+            quality: self.quality.as_deref(),
+            width: self.width,
+            height: self.height,
+            frame_rate: self.frame_rate,
+            bitrate_mbps: self.bitrate_mbps,
+            resolution: self.resolution.as_deref(),
+        }.validate()
+    }
+
     /// Load config from a TOML file path, or use defaults if None.
     pub fn load_from_file(path: Option<&std::path::Path>) -> anyhow::Result<Self> {
-        if let Some(path) = path {
-            let content = std::fs::read_to_string(path)?;
-            Ok(toml::from_str(&content)?)
+        let default_path = config_dir().join("config.toml");
+        let config: Self = if let Some(path) = path {
+            toml::from_str(&std::fs::read_to_string(path)?)?
+        } else if default_path.exists() {
+            toml::from_str(&std::fs::read_to_string(default_path)?)?
         } else {
-            let default_path = config_dir().join("config.toml");
-            if default_path.exists() {
-                let content = std::fs::read_to_string(&default_path)?;
-                Ok(toml::from_str(&content)?)
-            } else {
-                Ok(ServerConfig::default())
-            }
-        }
+            Self::default()
+        };
+        config.validate()?;
+        Ok(config)
     }
 }
 

@@ -542,6 +542,21 @@ impl RdpServer {
             return Ok((RunState::DeactivationReactivation { desktop_size }, encoder));
         }
 
+        // Negotiation commits the connection to a single transport. Never feed
+        // a delayed bitmap into a GFX session or AVC into a bitmap-only client.
+        let graphics_mode = gfx_state.lock().unwrap().graphics_mode();
+        let incompatible = match &update {
+            DisplayUpdate::Bitmap(_) => graphics_mode != crate::gfx::GraphicsMode::Bitmap,
+            DisplayUpdate::GfxFrame(_) | DisplayUpdate::GfxUncompressed(_) => {
+                graphics_mode != crate::gfx::GraphicsMode::Avc
+            }
+            _ => false,
+        };
+        if incompatible {
+            trace!(?graphics_mode, "Dropping update for inactive graphics transport");
+            return Ok((RunState::Continue, encoder));
+        }
+
         // Handle GFX frames through the DVC channel
         if let DisplayUpdate::GfxFrame(ref gfx_frame) = update {
             let mut state = gfx_state.lock().unwrap();
@@ -759,6 +774,10 @@ impl RdpServer {
         W: FramedWrite,
     {
         debug!("Starting client loop");
+        let drdynvc_channel_id = self.get_channel_id_by_type::<dvc::DrdynvcServer>();
+        if !self.gfx_enabled || drdynvc_channel_id.is_none() {
+            self.gfx_state.lock().unwrap().use_bitmap("GFX dynamic channel is unavailable");
+        }
         let mut display_updates = self.display.lock().await.updates().await?;
         let mut writer = SharedWriter::new(writer);
         let mut display_writer = writer.clone();
@@ -773,9 +792,6 @@ impl RdpServer {
             gs.width = size.width;
             gs.height = size.height;
         }
-
-        // Get DRDYNVC channel ID for sending GFX frames
-        let drdynvc_channel_id = self.get_channel_id_by_type::<dvc::DrdynvcServer>();
 
         let s = Rc::new(Mutex::new(self));
 

@@ -3,6 +3,37 @@
 Notable changes to MacRDP are recorded here. Release tags follow `vMAJOR.MINOR.PATCH`.
 During `0.x` development, compatibility changes are documented in each release.
 
+## [Unreleased]
+
+### Added
+
+- A macOS 13 deployment target shared by the CLI and management UI.
+- Capability-based bitmap fallback for clients without GFX/AVC, including a bounded graphics negotiation timeout. Fast-Path output and 32-bit color remain required.
+- A configuration reference covering encoder selection, AVC420/AVC444, Apple media hardware, legacy aliases and resolution limits.
+- Validation for encoder options, frame rates, bitrates and dimensions, with visible configuration errors in the management UI.
+
+### Changed
+
+- `auto` now prefers available VideoToolbox hardware before falling back to OpenH264. Select `software` to retain explicit CPU encoding.
+- VideoToolbox retries compatible H.264 profiles and ordinary hardware sessions when low-latency options are unavailable.
+- Capture and encoder changes in the management UI request a service restart so their settings take effect together.
+
+### Fixed
+
+- Indefinite display waits when a client does not establish an AVC graphics channel; late negotiation cannot override a selected bitmap session.
+- NV12 capture conversion for bitmap fallback, with color-space-aware BGRA output.
+- Bitmap widths that are not multiples of four, padded row handling and incomplete initial updates.
+- Frame draining that could discard the newest available image.
+- CoreGraphics fallback image dimensions and capture updates that could reset unrelated settings.
+- Failed VideoToolbox session and CoreFoundation temporary-object cleanup.
+- Numeric configuration overflow and invalid updates replacing the active UI configuration.
+
+### Compatibility
+
+- macOS 12 and earlier require a separate capture implementation and remain outside this build's runtime range.
+- Older client behavior is selected by negotiated protocol capabilities; slow-path-only or lower-color-depth clients are outside the supported path.
+- The existing `v0.1.0` release remains unchanged and retains its original macOS 14+ requirement.
+
 ## [0.1.0] - 2026-09-21
 
 First public source release of this repository, based on [x6nux/macrdp](https://github.com/x6nux/macrdp) at `6be70bb`.
@@ -48,4 +79,5 @@ First public source release of this repository, based on [x6nux/macrdp](https://
 - The original capture, protocol integration, input and management UI implementations come from [x6nux/macrdp](https://github.com/x6nux/macrdp).
 - GPLv3 is retained. The modified IronRDP crates retain their MIT / Apache-2.0 licenses.
 
+[Unreleased]: https://github.com/likehbbfoe/MacRDP/compare/v0.1.0...main
 [0.1.0]: https://github.com/likehbbfoe/MacRDP/releases/tag/v0.1.0

@@ -15,3 +15,5 @@ pub use callbacks::*;
 pub use config::{config_dir, AudioConfig, ClipboardConfig, ServerConfig};
 pub use log_bridge::{LogBridgeLayer, init_log_file, log_file_path};
 pub use server::{start_server, resolve_resolution, ServerHandle};
+
+pub use macrdp_encode::EncoderPreference;

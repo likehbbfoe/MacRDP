@@ -189,8 +189,10 @@ pub async fn set_config(
 ) -> Result<SetConfigResponse, String> {
     let restart_required = {
         let mut config = state.ui_config.lock().await;
-        let restart = config.set_field(&key, &value)?;
-        config.save()?;
+        let mut candidate = config.clone();
+        let restart = candidate.set_field(&key, &value)?;
+        candidate.save()?;
+        *config = candidate;
         restart
     };
     tracing::info!(setting = %key, "Configuration setting updated");

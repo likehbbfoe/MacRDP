@@ -30,6 +30,9 @@ pub(super) fn decode_advertisement(data: &[u8]) -> DecodeResult<CapabilitiesAdve
         return Err(invalid_field_err!("pduLength", "capability PDU length mismatch"));
     }
     let count = usize::from(cursor.read_u16());
+    if count == 0 {
+        return Err(invalid_field_err!("count", "empty capability advertisement"));
+    }
     ensure_size!(in: cursor, size: count * CAPABILITY_HEADER_SIZE);
     let mut known = Vec::new();
     for _ in 0..count {
@@ -39,9 +42,6 @@ pub(super) fn decode_advertisement(data: &[u8]) -> DecodeResult<CapabilitiesAdve
     }
     if !cursor.is_empty() {
         return Err(invalid_field_err!("count", "unconsumed capability data"));
-    }
-    if known.is_empty() {
-        return Err(invalid_field_err!("capabilities", "no supported capability versions"));
     }
     Ok(CapabilitiesAdvertisePdu(known))
 }

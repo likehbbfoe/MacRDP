@@ -104,38 +104,38 @@ impl UiConfig {
     }
 
     /// Update a single field by key name from a JSON value.
-    /// Returns `restart_required`: `false` for hot-updatable fields
-    /// (frame_rate, bitrate_mbps, log_level, theme, autostart), `true` for
-    /// everything else.
+    /// Returns whether capture, encoder or logging changes require a service restart.
+    /// Invalid updates leave the current configuration unchanged.
     pub fn set_field(
         &mut self,
         key: &str,
         value: &serde_json::Value,
     ) -> Result<bool, String> {
+        let mut candidate = self.clone();
+        let restart_required = candidate.apply_field(key, value)?;
+        candidate.to_server_config().validate().map_err(|err| err.to_string())?;
+        *self = candidate;
+        Ok(restart_required)
+    }
+
+    fn apply_field(&mut self, key: &str, value: &serde_json::Value) -> Result<bool, String> {
         match key {
             "port" => {
-                self.port = value
-                    .as_u64()
-                    .ok_or("port must be a number")?
-                    as u16;
+                self.port = u16::try_from(value.as_u64().ok_or("port must be a number")?)
+                    .map_err(|_| "port is out of range")?;
             }
             "frame_rate" => {
-                self.frame_rate = value
-                    .as_u64()
-                    .ok_or("frame_rate must be a number")?
-                    as u32;
+                self.frame_rate = u32::try_from(value.as_u64().ok_or("frame_rate must be a number")?)
+                    .map_err(|_| "frame_rate is out of range")?;
             }
             "bitrate_mbps" => {
-                self.bitrate_mbps = value
-                    .as_u64()
-                    .ok_or("bitrate_mbps must be a number")?
-                    as u32;
+                self.bitrate_mbps = u32::try_from(value.as_u64().ok_or("bitrate_mbps must be a number")?)
+                    .map_err(|_| "bitrate_mbps is out of range")?;
             }
             "encoder" => {
-                self.encoder = value
-                    .as_str()
-                    .ok_or("encoder must be a string")?
-                    .to_string();
+                self.encoder = macrdp_core::EncoderPreference::try_from_str_opt(Some(
+                    value.as_str().ok_or("encoder must be a string")?
+                )).map_err(|err| err.to_string())?.as_str().to_owned();
             }
             "chroma_mode" => {
                 self.chroma_mode = value
@@ -150,10 +150,8 @@ impl UiConfig {
                     .to_string();
             }
             "max_connections" => {
-                self.max_connections = value
-                    .as_u64()
-                    .ok_or("max_connections must be a number")?
-                    as u32;
+                self.max_connections = u32::try_from(value.as_u64().ok_or("max_connections must be a number")?)
+                    .map_err(|_| "max_connections is out of range")?;
             }
             "idle_timeout_secs" => {
                 self.idle_timeout_secs = value
@@ -207,10 +205,11 @@ impl UiConfig {
             _ => return Err(format!("unknown config key: {key}")),
         }
 
-        // Hot-updatable fields do NOT require a restart.
-        // Only "theme" and "autostart" are pure UI settings.
-        // All other server settings are hot-updatable or auto-restarted.
-        let restart_required = false;
+        // Capture and encoder changes must take effect together in a new session.
+        let restart_required = matches!(key,
+            "frame_rate" | "encoder" | "chroma_mode" | "resolution" |
+            "hidpi_scale" | "show_cursor" | "log_level"
+        );
         Ok(restart_required)
     }
 

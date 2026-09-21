@@ -1,17 +1,18 @@
 //! Video encoding abstraction (H.264 via VideoToolbox / OpenH264)
 
 mod openh264_enc;
+mod settings;
 pub mod yuv444_split;
 #[cfg(target_os = "macos")]
 pub mod color_convert;
 #[cfg(target_os = "macos")]
 mod videotoolbox;
-#[cfg(target_os = "macos")]
 
 use anyhow::Result;
 use bytes::Bytes;
 
 pub use openh264_enc::OpenH264Encoder;
+pub use settings::{validate_dimensions, VideoSettings, MAX_DIMENSION, MAX_PIXELS};
 #[cfg(target_os = "macos")]
 pub use videotoolbox::VtEncoder;
 
@@ -107,26 +108,39 @@ pub fn screen_bitrate(width: u32, height: u32, fps: f32, quality: Quality) -> u3
         Quality::HighQuality => 24.0,
     };
     let fps_factor = (fps as f64 / 30.0).max(1.0);
-    (pixels * base_bpp * fps_factor) as u32
+    (pixels * base_bpp * fps_factor).clamp(100_000.0, 1_000_000_000.0) as u32
 }
 
 /// Encoder preference
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EncoderPreference {
-    /// OpenH264 CPU encoder — full P-frame support, higher latency (~40ms)
+    /// OpenH264 CPU encoding with accelerated color conversion where available.
     Software,
-    /// VideoToolbox GPU encoder — low latency (~6ms), supports P-frames
+    /// VideoToolbox media hardware, with software fallback if initialization fails.
     Hardware,
-    /// Same as Software (recommended default)
+    /// Prefer available hardware and fall back to OpenH264.
     Auto,
 }
 
 impl EncoderPreference {
     pub fn from_str_opt(s: Option<&str>) -> Self {
-        match s.map(|s| s.to_lowercase()).as_deref() {
-            Some("hardware") | Some("gpu") | Some("videotoolbox") | Some("vt") => Self::Hardware,
-            Some("software") | Some("cpu") | Some("openh264") | Some("oh264") => Self::Software,
-            _ => Self::Auto,
+        Self::try_from_str_opt(s).unwrap_or(Self::Auto)
+    }
+
+    pub fn try_from_str_opt(s: Option<&str>) -> Result<Self> {
+        match s.map(|s| s.trim().to_ascii_lowercase()).as_deref() {
+            Some("hardware" | "gpu" | "videotoolbox" | "vt") => Ok(Self::Hardware),
+            Some("software" | "cpu" | "openh264" | "oh264") => Ok(Self::Software),
+            None | Some("auto") => Ok(Self::Auto),
+            _ => anyhow::bail!("encoder must be auto, hardware or software; HEVC and AV1 are not RDP output modes"),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Auto => "auto",
+            Self::Hardware => "hardware",
+            Self::Software => "software",
         }
     }
 }
@@ -134,6 +148,9 @@ impl EncoderPreference {
 /// Create an H.264 encoder based on preference.
 /// When `mode_444` is true, the encoder will initialize dual sessions for AVC444 support.
 pub fn create_encoder(width: u32, height: u32, fps: f32, _quality: Quality, preference: EncoderPreference, mode_444: bool, bitrate: u32) -> Result<Box<dyn VideoEncoder>> {
+    validate_dimensions(width, height)?;
+    anyhow::ensure!(fps.is_finite() && fps >= 1.0 && fps <= 120.0, "Encoder frame rate must be between 1 and 120");
+    anyhow::ensure!(bitrate > 0 && bitrate <= 1_000_000_000, "Encoder bitrate is out of range");
     let enc_w = align16(width);
     let enc_h = align16(height);
 
@@ -161,7 +178,7 @@ fn create_with_fallback(
     hardware: impl FnOnce() -> Result<Box<dyn VideoEncoder>>,
     software: impl FnOnce() -> Result<Box<dyn VideoEncoder>>,
 ) -> Result<Box<dyn VideoEncoder>> {
-    if preference == EncoderPreference::Hardware {
+    if preference != EncoderPreference::Software {
         match hardware() {
             Ok(encoder) => return Ok(encoder),
             Err(e) => {

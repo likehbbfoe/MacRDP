@@ -11,6 +11,9 @@ use std::sync::Arc;
 use crate::color_convert::VImageConverter;
 use crate::{Avc444EncodedFrame, EncodedFrame, VideoEncoder};
 
+#[path = "vt_session_policy.rs"]
+mod session_policy;
+
 // --- FFI declarations ---
 
 type CVPixelBufferRef = *mut c_void;
@@ -153,10 +156,8 @@ extern "C" {
     static kVTCompressionPropertyKey_AllowTemporalCompression: CFStringRef;
     static kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: CFStringRef;
     static kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder: CFStringRef;
-    static kVTVideoEncoderSpecification_EnableLowLatencyRateControl: CFStringRef;
     static kVTProfileLevel_H264_High_AutoLevel: CFStringRef;
     static kVTProfileLevel_H264_Baseline_AutoLevel: CFStringRef;
-    static kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel: CFStringRef;
     static kVTH264EntropyMode_CABAC: CFStringRef;
     static kVTH264EntropyMode_CAVLC: CFStringRef;
 
@@ -176,6 +177,8 @@ extern "C" {
     fn CFStringCreateWithCString(alloc: CFAllocatorRef, c_str: *const i8, encoding: u32) -> CFStringRef;
 
     static kCFTypeArrayCallBacks: c_void;
+    static kCFTypeDictionaryKeyCallBacks: c_void;
+    static kCFTypeDictionaryValueCallBacks: c_void;
     static kVTEncodeFrameOptionKey_ForceKeyFrame: CFStringRef;
     static kVTCompressionPropertyKey_DataRateLimits: CFStringRef;
     static kVTCompressionPropertyKey_ColorPrimaries: CFStringRef;
@@ -203,6 +206,61 @@ fn cf_i32(v: i32) -> CFTypeRef {
 }
 fn cf_f64(v: f64) -> CFTypeRef {
     unsafe { CFNumberCreate(std::ptr::null(), K_CF_NUMBER_FLOAT64_TYPE, &v as *const _ as *const c_void) }
+}
+
+/// Own a Create/Copy-rule object across every early return during session setup.
+struct OwnedCf(CFTypeRef);
+
+impl OwnedCf {
+    fn new(value: CFTypeRef, name: &str) -> Result<Self> {
+        anyhow::ensure!(!value.is_null(), "Cannot allocate {name}");
+        Ok(Self(value))
+    }
+
+    fn string(value: &str) -> Result<Self> {
+        let value = std::ffi::CString::new(value)?;
+        Self::new(unsafe {
+            CFStringCreateWithCString(std::ptr::null(), value.as_ptr(), 0x08000100)
+        }, "VideoToolbox option string")
+    }
+
+    fn dictionary(keys: &[CFTypeRef], values: &[CFTypeRef]) -> Result<Self> {
+        anyhow::ensure!(keys.len() == values.len(), "Dictionary key/value count mismatch");
+        Self::new(unsafe {
+            CFDictionaryCreate(
+                std::ptr::null(), keys.as_ptr(), values.as_ptr(), keys.len() as isize,
+                std::ptr::addr_of!(kCFTypeDictionaryKeyCallBacks),
+                std::ptr::addr_of!(kCFTypeDictionaryValueCallBacks),
+            )
+        }, "VideoToolbox option dictionary")
+    }
+}
+
+impl Drop for OwnedCf {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0) }
+    }
+}
+
+struct PendingSession(VTCompressionSessionRef);
+
+impl PendingSession {
+    fn into_raw(self) -> VTCompressionSessionRef {
+        let session = self.0;
+        std::mem::forget(self);
+        session
+    }
+}
+
+impl Drop for PendingSession {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                VTCompressionSessionInvalidate(self.0);
+                CFRelease(self.0);
+            }
+        }
+    }
 }
 
 // --- Callback context (shared between encoder thread and VT callback thread) ---
@@ -495,118 +553,115 @@ impl VtEncoder {
         callback_ctx: &Arc<CallbackCtx>,
         pixel_format: u32,
     ) -> Result<VTCompressionSessionRef> {
-        let mut session: VTCompressionSessionRef = std::ptr::null_mut();
+        anyhow::ensure!(width > 0 && height > 0, "Encoder dimensions must be positive");
+        anyhow::ensure!(width <= i32::MAX as u32 && height <= i32::MAX as u32,
+            "Encoder dimensions exceed VideoToolbox limits");
+        anyhow::ensure!(fps.is_finite() && fps > 0.0, "Encoder frame rate is invalid");
+        anyhow::ensure!(bitrate > 0 && bitrate <= i32::MAX as u32, "Encoder bitrate is invalid");
+        session_policy::try_hardware_modes(|low_latency| {
+            // Drivers may defer profile validation until preparation. A failed
+            // candidate is released before retrying the next profile from scratch.
+            session_policy::try_profiles(|profile| {
+                let session = Self::allocate_hardware_session(
+                    width, height, callback_ctx, pixel_format, low_latency,
+                )?;
+                Self::configure_hardware_session(session.0, fps, bitrate, profile)?;
+                let status = unsafe { VTCompressionSessionPrepareToEncodeFrames(session.0) };
+                anyhow::ensure!(status == 0, "VTCompressionSessionPrepareToEncodeFrames failed: {status}");
+                Self::verify_hardware_acceleration(session.0)?;
+                tracing::info!(low_latency, profile, "VideoToolbox hardware session configured");
+                Ok(session.into_raw())
+            })
+        })
+    }
 
+    fn allocate_hardware_session(
+        width: u32, height: u32, callback_ctx: &Arc<CallbackCtx>,
+        pixel_format: u32, low_latency: bool,
+    ) -> Result<PendingSession> {
+        // The optional key is resolved at runtime; ordinary hardware selection
+        // must remain available when a chip cannot provide the low-latency mode.
+        let low_latency_key = if low_latency {
+            Some(OwnedCf::string("EnableLowLatencyRateControl")?)
+        } else {
+            None
+        };
+        let format = OwnedCf::new(cf_i32(pixel_format as i32), "pixel format")?;
+        let width_value = OwnedCf::new(cf_i32(width as i32), "frame width")?;
+        let height_value = OwnedCf::new(cf_i32(height as i32), "frame height")?;
         unsafe {
-            // Hardware acceleration + low-latency rate control.
-            // Low-latency RC produces clean first keyframes and adapts QP per-frame.
-            // AverageBitRate serves as a target hint for its internal algorithm.
-            let spec_keys = [
-                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder,
-                kVTVideoEncoderSpecification_EnableLowLatencyRateControl,
-            ];
-            let spec_values = [kCFBooleanTrue, kCFBooleanTrue];
-            let encoder_spec = CFDictionaryCreate(
-                std::ptr::null(), spec_keys.as_ptr(), spec_values.as_ptr(),
-                2, std::ptr::null(), std::ptr::null(),
-            );
-            anyhow::ensure!(!encoder_spec.is_null(), "Cannot create hardware-only encoder specification");
-
-            // Source image buffer attributes — tell VT what pixel format to expect.
-            // This allows VT to create a compatible pixel buffer pool.
-            let src_keys: [CFTypeRef; 3] = [
-                kCVPixelBufferPixelFormatTypeKey as CFTypeRef,
-                kCVPixelBufferWidthKey as CFTypeRef,
-                kCVPixelBufferHeightKey as CFTypeRef,
-            ];
-            let fmt_num = cf_i32(pixel_format as i32);
-            let w_num = cf_i32(width as i32);
-            let h_num = cf_i32(height as i32);
-            let src_values: [CFTypeRef; 3] = [fmt_num, w_num, h_num];
-            let src_attrs = CFDictionaryCreate(
-                std::ptr::null(), src_keys.as_ptr(), src_values.as_ptr(),
-                3, std::ptr::null(), std::ptr::null(),
-            );
-
+            let encoder_spec = if let Some(key) = &low_latency_key {
+                OwnedCf::dictionary(
+                    &[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder, key.0],
+                    &[kCFBooleanTrue, kCFBooleanTrue],
+                )?
+            } else {
+                OwnedCf::dictionary(
+                    &[kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder],
+                    &[kCFBooleanTrue],
+                )?
+            };
+            let source_attrs = OwnedCf::dictionary(
+                &[kCVPixelBufferPixelFormatTypeKey, kCVPixelBufferWidthKey, kCVPixelBufferHeightKey],
+                &[format.0, width_value.0, height_value.0],
+            )?;
+            let mut raw_session = std::ptr::null_mut();
             let status = VTCompressionSessionCreate(
-                std::ptr::null(), width as i32, height as i32,
-                K_CM_VIDEO_CODEC_TYPE_H264,
-                encoder_spec,
-                src_attrs,  // source image buffer attributes
-                std::ptr::null(),
-                Some(encode_callback),
-                Arc::as_ptr(callback_ctx) as *mut c_void,
-                &mut session,
+                std::ptr::null(), width as i32, height as i32, K_CM_VIDEO_CODEC_TYPE_H264,
+                encoder_spec.0, source_attrs.0, std::ptr::null(), Some(encode_callback),
+                Arc::as_ptr(callback_ctx) as *mut c_void, &mut raw_session,
             );
+            // A partially initialized session is released even on an error status.
+            let session = PendingSession(raw_session);
+            anyhow::ensure!(status == 0 && !session.0.is_null(), "VTCompressionSessionCreate failed: {status}");
+            Ok(session)
+        }
+    }
 
-            CFRelease(encoder_spec as *const _);
-            CFRelease(src_attrs as *const _);
-            CFRelease(fmt_num);
-            CFRelease(w_num);
-            CFRelease(h_num);
-
-            if status != 0 || session.is_null() {
-                anyhow::bail!("VTCompressionSessionCreate failed: {status}");
-            }
-
-            // Constrained Baseline Profile — compatible with Apple Silicon hardware encoder
-            // in low-latency mode. High Profile causes null sample_buffer (frame drops) on
-            // Apple Silicon with RequireHardwareAccelerated + EnableLowLatencyRateControl.
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel,
-                kVTProfileLevel_H264_ConstrainedBaseline_AutoLevel);
-            // Explicit CAVLC entropy mode (required for Constrained Baseline)
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_H264EntropyMode,
-                kVTH264EntropyMode_CAVLC);
-            // Low-latency: no frame reordering, no B-frames, zero delay
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse);
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxFrameDelayCount, cf_i32(0));
-            // Temporal compression (P-frames) — do NOT set ReferenceBufferCount
-            // (on Apple Silicon, setting it to 1 forces all-IDR)
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue);
-            // Force full-range video output (Y: 0-255) to avoid washed-out colors.
-            // Without this, VT defaults to video range (Y: 16-235) which looks gray.
-            VTSessionSetProperty(session, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanTrue);
-
-            // Rate control: AverageBitRate only (soft target).
-            // VT will aim for this average but allow bursts for keyframes.
-            // No DataRateLimits — hard ceiling starves first keyframe causing blur.
-            // No EnableLowLatencyRateControl — it ignores AverageBitRate entirely.
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64));
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate as i32));
-            tracing::info!(bitrate_mbps = bitrate as f64 / 1_000_000.0, fps, "VT session bitrate set");
-            // IDR every 5 seconds — less frequent keyframes reduce bandwidth spikes
-            VTSessionSetProperty(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(fps as i32 * 5));
-
-            // PrioritizeEncodingSpeedOverQuality (macOS 14+) — reduce encode latency
-            {
-                let key_bytes = b"PrioritizeEncodingSpeedOverQuality\0";
-                let key = CFStringCreateWithCString(
-                    std::ptr::null(),
-                    key_bytes.as_ptr() as *const i8,
-                    0x08000100, // kCFStringEncodingUTF8
-                );
-                if !key.is_null() {
-                    VTSessionSetProperty(session, key, kCFBooleanTrue);
-                    CFRelease(key);
-                }
-            }
-
-            let status = VTCompressionSessionPrepareToEncodeFrames(session);
+    fn configure_hardware_session(session: VTCompressionSessionRef, fps: f32, bitrate: u32, profile: &str) -> Result<()> {
+        // Preserve the working Constrained Baseline path, then try profiles
+        // supported by older encoders. Never silently accept the default profile.
+        let value = OwnedCf::string(profile)?;
+        let status = unsafe { VTSessionSetProperty(session, kVTCompressionPropertyKey_ProfileLevel, value.0) };
+        anyhow::ensure!(status == 0, "ProfileLevel rejected with status {status}");
+        unsafe {
+            let status = VTSessionSetProperty(session, kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+            // Baseline syntax cannot contain B-frames even when this optional
+            // property is absent. Main/High must explicitly disable reordering.
+            anyhow::ensure!(status == 0 || profile.contains("Baseline"),
+                "Cannot disable frame reordering for {profile}: {status}");
             if status != 0 {
-                VTCompressionSessionInvalidate(session);
-                CFRelease(session);
-                anyhow::bail!("VTCompressionSessionPrepareToEncodeFrames failed: {status}");
+                tracing::debug!(status, profile, "Frame reordering property unavailable; Baseline excludes B-frames");
             }
-            if let Err(error) = Self::verify_hardware_acceleration(session) {
-                VTCompressionSessionInvalidate(session);
-                CFRelease(session);
-                return Err(error);
+            Self::set_optional_property(session, kVTCompressionPropertyKey_H264EntropyMode, kVTH264EntropyMode_CAVLC, "H264EntropyMode");
+            Self::set_optional_property(session, kVTCompressionPropertyKey_RealTime, kCFBooleanTrue, "RealTime");
+            Self::set_optional_property(session, kVTCompressionPropertyKey_AllowOpenGOP, kCFBooleanFalse, "AllowOpenGOP");
+            Self::set_optional_property(session, kVTCompressionPropertyKey_AllowTemporalCompression, kCFBooleanTrue, "AllowTemporalCompression");
+            Self::set_optional_property(session, kCMFormatDescriptionExtension_FullRangeVideo, kCFBooleanTrue, "FullRangeVideo");
+            Self::set_optional_number(session, kVTCompressionPropertyKey_MaxFrameDelayCount, cf_i32(0), "MaxFrameDelayCount");
+            Self::set_optional_number(session, kVTCompressionPropertyKey_ExpectedFrameRate, cf_f64(fps as f64), "ExpectedFrameRate");
+            Self::set_optional_number(session, kVTCompressionPropertyKey_AverageBitRate, cf_i32(bitrate as i32), "AverageBitRate");
+            let keyframe_interval = (fps as f64 * 5.0).min(i32::MAX as f64) as i32;
+            Self::set_optional_number(session, kVTCompressionPropertyKey_MaxKeyFrameInterval, cf_i32(keyframe_interval), "MaxKeyFrameInterval");
+            if let Ok(key) = OwnedCf::string("PrioritizeEncodingSpeedOverQuality") {
+                Self::set_optional_property(session, key.0, kCFBooleanTrue, "PrioritizeEncodingSpeedOverQuality");
             }
         }
+        Ok(())
+    }
 
-        Ok(session)
+    fn set_optional_property(session: VTCompressionSessionRef, key: CFStringRef, value: CFTypeRef, name: &str) {
+        let status = unsafe { VTSessionSetProperty(session, key, value) };
+        if status != 0 {
+            tracing::debug!(property = name, status, "Optional VideoToolbox property unavailable");
+        }
+    }
+
+    fn set_optional_number(session: VTCompressionSessionRef, key: CFStringRef, value: CFTypeRef, name: &str) {
+        match OwnedCf::new(value, name) {
+            Ok(value) => Self::set_optional_property(session, key, value.0, name),
+            Err(error) => tracing::debug!(property = name, %error, "Optional VideoToolbox property unavailable"),
+        }
     }
 
     fn verify_hardware_acceleration(session: VTCompressionSessionRef) -> Result<()> {

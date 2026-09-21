@@ -13,6 +13,31 @@ use ironrdp_server::{Credentials, RdpServer, TlsIdentityCtx, gfx::GfxState};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
+fn resolve_resolution(res_mode: &str, logical_w: u32, logical_h: u32) -> Result<(u16, u16)> {
+    let (width, height) = if let Some((width, height)) = res_mode.split_once('x') {
+        (
+            width.parse::<u32>().context("Invalid resolution width")?,
+            height.parse::<u32>().context("Invalid resolution height")?,
+        )
+    } else {
+        let scale = if res_mode == "auto" {
+            macrdp_capture::detect_display_scale().unwrap_or(1)
+        } else {
+            let scale = res_mode.parse::<u32>().context("Invalid resolution scale")?;
+            anyhow::ensure!((1..=4).contains(&scale), "Resolution scale must be between 1 and 4");
+            scale
+        };
+        (
+            logical_w.checked_mul(scale).context("Scaled display width overflow")?,
+            logical_h.checked_mul(scale).context("Scaled display height overflow")?,
+        )
+    };
+    macrdp_encode::validate_dimensions(width, height)
+        .with_context(|| format!("Unsupported resolved display size {width}x{height}"))?;
+    tracing::info!(res_mode, width, height, "Display resolution resolved");
+    Ok((u16::try_from(width)?, u16::try_from(height)?))
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -67,17 +92,17 @@ async fn main() -> Result<()> {
     let (sck_w, sck_h) = match macrdp_capture::detect_display_size() {
         Ok((w, h)) => {
             tracing::info!(width = w, height = h, "SCK logical display size");
-            (w as u16, h as u16)
+            (w, h)
         }
         Err(e) => {
             tracing::warn!("Failed to detect SCK display size: {e}, defaulting to 1920x1080");
-            (1920u16, 1080u16)
+            (1920u32, 1080u32)
         }
     };
     let (cg_w, cg_h) = match macrdp_capture::detect_cg_display_size() {
         Ok((w, h)) => {
             tracing::info!(width = w, height = h, "CG logical display size (CGEvent coordinate space)");
-            (w as u16, h as u16)
+            (w, h)
         }
         Err(e) => {
             tracing::warn!("Failed to detect CG display size: {e}, falling back to SCK size");
@@ -93,7 +118,7 @@ async fn main() -> Result<()> {
 
     // Determine RDP desktop resolution (what we capture and send)
     let (width, height) = if config.width > 0 && config.height > 0 {
-        (config.width as u16, config.height as u16)
+        (config.width, config.height)
     } else {
         (sck_w, sck_h)
     };
@@ -116,31 +141,19 @@ async fn main() -> Result<()> {
     // Resolution: "auto", "WxH" (e.g. "3840x2160"), or legacy scale (e.g. "2")
     let res_mode = config.resolution.as_deref().unwrap_or("auto");
     let res_auto = res_mode == "auto";
-    let (width, height) = if res_mode == "auto" {
-        let scale = macrdp_capture::detect_display_scale().unwrap_or(1);
-        tracing::info!(scale, width, height, "Resolution auto: display scale");
-        (width * scale as u16, height * scale as u16)
-    } else if let Some((w, h)) = res_mode.split_once('x').and_then(|(w, h)| {
-        Some((w.parse::<u16>().ok()?, h.parse::<u16>().ok()?))
-    }) {
-        tracing::info!(w, h, "Resolution: explicit WxH");
-        (w, h)
-    } else if let Ok(scale) = res_mode.parse::<u32>() {
-        let scale = scale.max(1).min(4);
-        let (rw, rh) = (width as u32 * scale, height as u32 * scale);
-        tracing::info!(scale, rw, rh, "Resolution: legacy hidpi_scale → {}x{}", rw, rh);
-        (rw as u16, rh as u16)
-    } else {
-        tracing::warn!(res_mode, "Resolution: unrecognized, using logical");
-        (width, height)
-    };
+    let (width, height) = resolve_resolution(res_mode, width, height)?;
 
     // Mouse coordinate mapping: RDP desktop coords → macOS logical coords
     // MouseCoordMapper maps proportionally: mac = rdp × logical ÷ rdp_desktop
     // Completely independent of capture/encode resolution.
     // Updated by MacDisplay::request_resize() when the client negotiates a
     // different resolution.
-    let coord_mapper = handler::MouseCoordMapper::new(cg_w, cg_h, width, height);
+    let coord_mapper = handler::MouseCoordMapper::new(
+        u16::try_from(cg_w).context("Logical display width exceeds coordinate range")?,
+        u16::try_from(cg_h).context("Logical display height exceeds coordinate range")?,
+        width,
+        height,
+    );
     tracing::info!(
         rdp_w = width, rdp_h = height,
         cg_logical_w = cg_w, cg_logical_h = cg_h,

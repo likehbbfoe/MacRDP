@@ -3,7 +3,7 @@ use bytes::Bytes;
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, GfxFrameUpdate, GfxUncompressedUpdate,
     PixelFormat as RdpPixelFormat, RdpServerDisplay, RdpServerDisplayUpdates,
-    UncompressedRect, gfx::GfxState,
+    UncompressedRect, gfx::{GfxState, GraphicsMode},
 };
 use macrdp_audio::SharedAudioTx;
 use macrdp_capture::{CaptureConfig, CapturePixelFormat, CapturedFrame, CgFallbackCapturer, FrameData, ScreenCapturer};
@@ -144,6 +144,10 @@ impl RdpServerDisplay for MacDisplay {
             tracing::debug!("Ignoring resize request — resolution is fixed by config");
             return;
         }
+        if let Err(error) = macrdp_encode::validate_dimensions(width as u32, height as u32) {
+            tracing::warn!(width, height, %error, "Ignoring unsupported client resolution");
+            return;
+        }
         let w = width.min(self.max_width);
         let h = height.min(self.max_height);
         if w > 0 && h > 0 && (w != self.width || h != self.height) {
@@ -175,11 +179,20 @@ impl RdpServerDisplay for MacDisplay {
             tracing::warn!(%error, "H.264 initialization failed; using BGRA bitmap capture");
         }).ok();
 
+        let graphics_mode = {
+            let mut state = self.gfx_state.lock().unwrap();
+            if encoder.is_none() {
+                state.use_bitmap("H.264 encoder initialization failed");
+            }
+            state.graphics_mode()
+        };
+
         let capture_config = CaptureConfig {
             width: self.width as u32,
             height: self.height as u32,
             frame_rate: self.frame_rate,
-            pixel_format: if macrdp_encode::capture_uses_nv12(encoder.as_deref(), self.mode_444) {
+            pixel_format: if graphics_mode != GraphicsMode::Bitmap
+                && macrdp_encode::capture_uses_nv12(encoder.as_deref(), self.mode_444) {
                 CapturePixelFormat::Nv12
             } else {
                 CapturePixelFormat::Bgra
@@ -203,6 +216,7 @@ impl RdpServerDisplay for MacDisplay {
             base_bitrate: self.base_bitrate,
             mode_444: self.mode_444,
             display_frame_count: 0,
+            bitmap_started: false,
             skip_next_frame: false,
             overload_count: 0,
             perf_stats: self.perf_stats.clone(),
@@ -218,6 +232,7 @@ struct MacDisplayUpdates {
     base_bitrate: u32,
     mode_444: bool,
     display_frame_count: u64,
+    bitmap_started: bool,
     skip_next_frame: bool,
     /// Counter for rate-limiting encode overload warnings
     overload_count: u64,
@@ -228,6 +243,13 @@ struct MacDisplayUpdates {
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for MacDisplayUpdates {
     async fn next_update(&mut self) -> Result<Option<DisplayUpdate>> {
+        // Keep the initial capture buffered until the connection chooses its
+        // transport, including when the desktop immediately becomes idle.
+        loop {
+            let mode = self.gfx_state.lock().unwrap().graphics_mode();
+            if mode != GraphicsMode::Pending { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
         // Drain stale frames — always use the latest available frame.
         // If SCK capturer stops (e.g. screen locked), fall back to CGDisplayCreateImage
         // which works at the display level (including lock screen).
@@ -266,11 +288,14 @@ impl RdpServerDisplayUpdates for MacDisplayUpdates {
             };
             // If another frame is already buffered, skip this one and grab the newer one
             // This prevents frame queuing which adds latency
-            match self.capturer.try_next_frame() {
-                Some(macrdp_capture::CaptureEvent::Frame(_newer)) => continue,
-                Some(macrdp_capture::CaptureEvent::Idle) => break frame,
-                None => break frame,
+            let mut latest = frame;
+            while let Some(event) = self.capturer.try_next_frame() {
+                match event {
+                    macrdp_capture::CaptureEvent::Frame(newer) => latest = newer,
+                    macrdp_capture::CaptureEvent::Idle => break,
+                }
             }
+            break latest;
         };
 
         self.encode_and_send(frame)
@@ -286,18 +311,19 @@ impl MacDisplayUpdates {
         }
 
         // Check GFX state and AVC444 negotiation
-        let (gfx_ready, use_444) = {
-            let state = self.gfx_state.lock().unwrap();
-            let ready = state.is_ready() && self.encoder.is_some();
+        let (graphics_mode, gfx_ready, use_444) = {
+            let mut state = self.gfx_state.lock().unwrap();
+            let mode = state.graphics_mode();
+            let ready = state.is_ready();
             let use_444 = self.mode_444
                 && state.avc444_supported
                 && state.avc444_enabled;
-            (ready, use_444)
+            (mode, ready, use_444)
         };
 
         if gfx_ready {
             // GFX uncompressed path — for small dirty regions, skip H.264 encoding entirely
-            if !frame.dirty_rects.is_empty() {
+            if self.display_frame_count > 0 && !frame.dirty_rects.is_empty() {
                 let total_area: u32 = frame.dirty_rects.iter()
                     .map(|r| r.width * r.height)
                     .sum();
@@ -544,23 +570,38 @@ impl MacDisplayUpdates {
                     }
                 }
             }
-        } else if self.encoder.is_some() {
-            // H.264 encoder exists — never send bitmaps, wait for GFX to become ready.
-            // Mixing bitmap and GFX causes 0xd06 DECOMPRESSION_FAILED on reconnect.
+        } else if graphics_mode != GraphicsMode::Bitmap {
             return Ok(Some(DisplayUpdate::DefaultPointer));
         }
 
-        // Bitmap path (only when GFX is not available at all)
-        // Requires BGRA raw bytes — PixelBuffer frames should not reach here
+        // NV12 capture can precede a late GFX rejection or negotiation timeout.
+        // Convert only on fallback, preserving zero-copy capture for AVC clients.
+        let frame = frame.into_bgra()?;
         let bgra_bitmap = match &frame.data {
             FrameData::Raw(bytes) => bytes,
             FrameData::PixelBuffer(_) => {
-                tracing::warn!("PixelBuffer frame in bitmap path — should not happen");
-                return Ok(Some(DisplayUpdate::DefaultPointer));
+                anyhow::bail!("BGRA conversion returned a pixel buffer");
             }
         };
 
-        if !frame.dirty_rects.is_empty() {
+        if graphics_mode == GraphicsMode::Avc {
+            // Once GFX is active, an encoder failure must use its uncompressed
+            // codec instead of injecting a legacy bitmap into the connection.
+            let row_bytes = frame.width as usize * 4;
+            let mut pixels = Vec::with_capacity(row_bytes * frame.height as usize);
+            for row in bgra_bitmap.chunks(frame.stride).take(frame.height as usize) {
+                pixels.extend_from_slice(&row[..row_bytes]);
+            }
+            return Ok(Some(DisplayUpdate::GfxUncompressed(GfxUncompressedUpdate {
+                rects: vec![UncompressedRect {
+                    x: 0, y: 0, width: frame.width as u16, height: frame.height as u16,
+                    pixel_data: Bytes::from(pixels),
+                }],
+                width: frame.width as u16, height: frame.height as u16,
+            })));
+        }
+
+        if self.bitmap_started && !frame.dirty_rects.is_empty() {
             // Find bounding box of all dirty rects to send a single update
             let mut min_x = frame.width;
             let mut min_y = frame.height;
@@ -613,6 +654,7 @@ impl MacDisplayUpdates {
         }
 
         // No dirty rects available — send full frame (first frame or fallback)
+        self.bitmap_started = true;
         let Some(width) = NonZeroU16::new(frame.width as u16) else { return Ok(None) };
         let Some(height) = NonZeroU16::new(frame.height as u16) else { return Ok(None) };
         let Some(stride) = NonZeroUsize::new(frame.stride) else { return Ok(None) };

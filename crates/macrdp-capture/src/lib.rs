@@ -1,5 +1,9 @@
 //! macOS screen capture via ScreenCaptureKit
 
+mod bitmap;
+mod os_support;
+mod stream_config;
+
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -8,7 +12,7 @@ use bytes::Bytes;
 use core_graphics::access::ScreenCaptureAccess;
 use screencapturekit::cv::{CVPixelBuffer, CVPixelBufferLockFlags};
 use screencapturekit::prelude::*;
-use screencapturekit::stream::configuration::{AudioChannelCount, AudioSampleRate};
+use stream_config::{stream_configuration, validate_frame_rate};
 use tokio::sync::mpsc;
 
 /// Check if Screen Recording permission is granted (no prompt)
@@ -90,6 +94,25 @@ pub struct CapturedFrame {
     pub dirty_rects: Vec<Rect>,
 }
 
+impl CapturedFrame {
+    /// Convert retained pixel buffers to packed sRGB BGRA for bitmap transport.
+    /// Raw frames retain their allocation and existing stride without copying.
+    pub fn into_bgra(self) -> Result<Self> {
+        match &self.data {
+            FrameData::Raw(_) => Ok(self),
+            FrameData::PixelBuffer(buffer) => {
+                let (bytes, stride) =
+                    bitmap::pixel_buffer_to_bgra(buffer, self.width, self.height)?;
+                Ok(Self {
+                    data: FrameData::Raw(bytes),
+                    stride,
+                    ..self
+                })
+            }
+        }
+    }
+}
+
 /// Raw audio frame from ScreenCaptureKit audio callback.
 /// Data is interleaved Float32 PCM (L0,R0, L1,R1, ...).
 #[derive(Clone)]
@@ -115,6 +138,9 @@ pub struct CaptureConfig {
 pub struct ScreenCapturer {
     stream: SCStream,
     frame_rx: mpsc::Receiver<CaptureEvent>,
+    config: CaptureConfig,
+    captures_audio: bool,
+    runtime_updates_supported: bool,
 }
 
 struct VideoOutputHandler {
@@ -149,7 +175,9 @@ impl SCStreamOutputTrait for AudioOutputHandler {
             return;
         }
 
-        let Some(audio_buffer_list) = sample.audio_buffer_list() else { return };
+        let Some(audio_buffer_list) = sample.audio_buffer_list() else {
+            return;
+        };
 
         let timestamp = sample.presentation_timestamp();
         let timestamp_ms = if timestamp.timescale > 0 {
@@ -187,9 +215,7 @@ impl SCStreamOutputTrait for AudioOutputHandler {
                 .filter_map(|i| audio_buffer_list.get(i))
                 .map(|buf| {
                     let raw = buf.data();
-                    unsafe {
-                        std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4)
-                    }
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, raw.len() / 4) }
                 })
                 .collect();
 
@@ -352,22 +378,29 @@ fn extract_frame_nv12(sample: &CMSampleBuffer) -> Option<CaptureEvent> {
 
 /// Detect the main display's native scale factor (1 for non-Retina, 2 for Retina).
 pub fn detect_display_scale() -> Result<u32> {
+    os_support::require_supported_macos()?;
     use core_graphics::display::CGDisplay;
     let main = CGDisplay::main();
     let physical_w = main.pixels_wide() as u32;
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
-    let display = content.displays().into_iter().next()
+    let content = SCShareableContent::get().context("Failed to get shareable content")?;
+    let display = content
+        .displays()
+        .into_iter()
+        .next()
         .context("No display found")?;
     let logical_w = display.width();
-    let scale = if logical_w > 0 { physical_w / logical_w } else { 1 };
+    let scale = if logical_w > 0 {
+        physical_w / logical_w
+    } else {
+        1
+    };
     Ok(scale.max(1))
 }
 
 /// Query the main display's resolution (from ScreenCaptureKit, used for capture sizing)
 pub fn detect_display_size() -> Result<(u32, u32)> {
-    let content = SCShareableContent::get()
-        .context("Failed to get shareable content")?;
+    os_support::require_supported_macos()?;
+    let content = SCShareableContent::get().context("Failed to get shareable content")?;
     let display = content
         .displays()
         .into_iter()
@@ -400,6 +433,8 @@ impl ScreenCapturer {
         config: CaptureConfig,
         audio_tx: Option<mpsc::Sender<AudioFrame>>,
     ) -> Result<Self> {
+        let macos_major = os_support::require_supported_macos()?;
+        validate_frame_rate(config.frame_rate)?;
         // SCShareableContent::get() is synchronous, run in blocking task
         let content = tokio::task::spawn_blocking(|| SCShareableContent::get())
             .await?
@@ -427,23 +462,13 @@ impl ScreenCapturer {
             .with_excluding_windows(&[])
             .build();
 
-        let frame_interval = CMTime::new(1, config.frame_rate as i32);
-
+        let config = CaptureConfig {
+            width: actual_width,
+            height: actual_height,
+            ..config
+        };
         let captures_audio = audio_tx.is_some();
-        let stream_config = SCStreamConfiguration::new()
-            .with_width(actual_width)
-            .with_height(actual_height)
-            .with_scales_to_fit(true)
-            .with_minimum_frame_interval(&frame_interval)
-            .with_pixel_format(match config.pixel_format {
-                CapturePixelFormat::Nv12 => PixelFormat::YCbCr_420f,
-                CapturePixelFormat::Bgra => PixelFormat::BGRA,
-            })
-            .with_shows_cursor(config.show_cursor)
-            .with_captures_audio(captures_audio)
-            .with_sample_rate(AudioSampleRate::Rate48000)
-            .with_channel_count(AudioChannelCount::Stereo)
-            .with_excludes_current_process_audio(true);
+        let stream_config = stream_configuration(&config, captures_audio, config.frame_rate)?;
 
         // Channel for capture events: buffer 2 entries to allow for jitter
         let (frame_tx, frame_rx): (mpsc::Sender<CaptureEvent>, mpsc::Receiver<CaptureEvent>) =
@@ -479,6 +504,9 @@ impl ScreenCapturer {
         Ok(Self {
             stream,
             frame_rx,
+            config,
+            captures_audio,
+            runtime_updates_supported: macos_major >= 14,
         })
     }
 
@@ -492,15 +520,21 @@ impl ScreenCapturer {
         self.frame_rx.try_recv().ok()
     }
 
-    /// Update capture frame rate at runtime.
-    /// Note: SCStream::update_configuration() blocks until completion via internal semaphore.
-    pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
-        use screencapturekit::cm::CMTime;
-        use screencapturekit::prelude::SCStreamConfiguration;
+    /// Whether this bridge supports changing a running capture configuration.
+    /// macOS 13 can capture at the initial rate, but the dependency only exposes
+    /// runtime updates on macOS 14 and later.
+    pub fn supports_runtime_frame_rate_update(&self) -> bool {
+        self.runtime_updates_supported
+    }
 
-        let interval = CMTime::new(1, fps as i32);
-        let mut config = SCStreamConfiguration::new();
-        config.set_minimum_frame_interval(&interval);
+    /// Update capture frame rate without resetting dimensions, format or audio.
+    /// macOS 13 requires restarting capture to change the rate. On newer systems
+    /// the dependency blocks until configuration completion.
+    pub fn set_frame_rate(&self, fps: u32) -> anyhow::Result<()> {
+        validate_frame_rate(fps)?;
+        anyhow::ensure!(self.runtime_updates_supported,
+            "Runtime capture frame-rate updates are unavailable on macOS 13; restart capture to change the rate");
+        let config = stream_configuration(&self.config, self.captures_audio, fps)?;
         self.stream
             .update_configuration(&config)
             .map_err(|e| anyhow::anyhow!("Failed to update SCStream frame rate: {:?}", e))?;
@@ -510,8 +544,8 @@ impl ScreenCapturer {
 }
 
 /// Fallback capturer using CGDisplayCreateImage (CoreGraphics).
-/// Works during lock screen because it captures at the display level,
-/// below the window server / ScreenCaptureKit layer.
+/// This is a best-effort compatibility path. The legacy API may return no image
+/// on newer macOS releases or while locked; lock-screen capture is not guaranteed.
 pub struct CgFallbackCapturer {
     display_id: u32,
     width: u32,
@@ -523,7 +557,11 @@ impl CgFallbackCapturer {
     /// Create a fallback capturer for the main display
     pub fn new(config: &CaptureConfig) -> Self {
         let display_id = core_graphics::display::CGDisplay::main().id;
-        let fps = if config.frame_rate > 0 { config.frame_rate } else { 30 };
+        let fps = if config.frame_rate > 0 {
+            config.frame_rate
+        } else {
+            30
+        };
         Self {
             display_id,
             width: config.width,
@@ -537,17 +575,29 @@ impl CgFallbackCapturer {
         let display = core_graphics::display::CGDisplay::new(self.display_id);
         let image = display.image()?;
 
-        let w = image.width() as u32;
-        let h = image.height() as u32;
-        let bpr = image.bytes_per_row();
-        let data = image.data();
-        let raw = data.bytes().to_vec();
+        let width = if self.width > 0 {
+            self.width
+        } else {
+            u32::try_from(image.width()).ok()?
+        };
+        let height = if self.height > 0 {
+            self.height
+        } else {
+            u32::try_from(image.height()).ok()?
+        };
+        let (bytes, stride) = match bitmap::render_bgra(&image, width, height) {
+            Ok(frame) => frame,
+            Err(error) => {
+                tracing::warn!(%error, "Unable to convert CoreGraphics fallback frame");
+                return None;
+            }
+        };
 
         Some(CapturedFrame {
-            width: if self.width > 0 { self.width } else { w },
-            height: if self.height > 0 { self.height } else { h },
-            data: FrameData::Raw(Bytes::from(raw)),
-            stride: bpr,
+            width,
+            height,
+            data: FrameData::Raw(bytes),
+            stride,
             timestamp_us: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap_or_default()

@@ -13,7 +13,7 @@ pub struct Cli {
     #[arg(short, long)]
     pub config: Option<PathBuf>,
 
-    /// Target frame rate (30, 60, or 120)
+    /// Target frame rate (1-120)
     #[arg(long)]
     pub frame_rate: Option<u32>,
 
@@ -82,10 +82,10 @@ pub struct ServerConfig {
     pub log_level: Option<String>,
     /// Video quality: low_latency, balanced, high_quality (default: high_quality)
     pub quality: Option<String>,
-    /// H.264 encoder: software, hardware, auto (default: software)
+    /// H.264 encoder: software, hardware, auto (default: auto)
     /// - software: OpenH264 CPU encoder with Accelerate/vImage color conversion
     /// - hardware: VideoToolbox hardware H.264 encoder; falls back to software on initialization failure
-    /// - auto: same as software
+    /// - auto: prefer available hardware, otherwise use software
     pub encoder: Option<String>,
     /// Chroma subsampling mode: "avc420" or "avc444" (default: "avc420")
     /// - avc420: standard 4:2:0 chroma (requires an AVC-capable RDP client)
@@ -156,6 +156,21 @@ impl Default for ServerConfig {
 }
 
 impl ServerConfig {
+    /// Reject incompatible or unsafe video options before starting the service.
+    pub fn validate(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.port != 0, "port must be between 1 and 65535");
+        macrdp_encode::VideoSettings {
+            encoder: self.encoder.as_deref(),
+            chroma_mode: self.chroma_mode.as_deref(),
+            quality: self.quality.as_deref(),
+            width: self.width,
+            height: self.height,
+            frame_rate: self.frame_rate,
+            bitrate_mbps: self.bitrate_mbps,
+            resolution: self.resolution.as_deref(),
+        }.validate()
+    }
+
     /// Load config from file, then apply CLI overrides
     pub fn load(cli: &Cli) -> anyhow::Result<Self> {
         let mut config = if let Some(path) = &cli.config {
@@ -188,6 +203,7 @@ impl ServerConfig {
             config.log_level = Some(level.clone());
         }
 
+        config.validate()?;
         Ok(config)
     }
 }
